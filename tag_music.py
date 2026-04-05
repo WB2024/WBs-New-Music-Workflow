@@ -380,9 +380,10 @@ class EssentiaAnalyzer:
             
             # Truncate to max duration — genre/mood classification doesn't need
             # the full track and this dramatically speeds up long files
-            max_samples = int(self.config.max_audio_duration * 16000)
-            if len(audio) > max_samples:
-                audio = audio[:max_samples]
+            if self.config.max_audio_duration < float('inf'):
+                max_samples = int(self.config.max_audio_duration * 16000)
+                if len(audio) > max_samples:
+                    audio = audio[:max_samples]
             
             # Get embeddings
             embeddings = self.embedding_model(audio)
@@ -876,9 +877,10 @@ def _worker_process_file(args):
         )()
 
         # Truncate to max duration
-        max_samples = int(config_dict['max_audio_duration'] * 16000)
-        if len(audio) > max_samples:
-            audio = audio[:max_samples]
+        if config_dict['max_audio_duration'] < float('inf'):
+            max_samples = int(config_dict['max_audio_duration'] * 16000)
+            if len(audio) > max_samples:
+                audio = audio[:max_samples]
 
         embeddings = _worker_models['embedding'](audio)
 
@@ -2105,7 +2107,8 @@ def run_tagging(music_path, config_overrides=None, log_dir=None):
     config.overwrite_existing = overrides.get('overwrite_existing', config.overwrite_existing)
     config.verbose = overrides.get('verbose', config.verbose)
     config.workers = overrides.get('workers', config.workers)
-    config.max_audio_duration = overrides.get('max_audio_duration', config.max_audio_duration)
+    max_dur = overrides.get('max_audio_duration', config.max_audio_duration)
+    config.max_audio_duration = float('inf') if max_dur <= 0 else max_dur
 
     # Model directory
     model_dir = overrides.get('model_dir', '~/essentia_models')

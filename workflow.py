@@ -939,6 +939,7 @@ def setup_service(cfg_dir: Path, settings: dict) -> None:
 
 TAGGED_DIR="{tagged_dir}"
 DEBOUNCE={debounce}
+STARTUP_DELAY={startup_delay}
 SCRIPT_DIR="{script_dir}"
 VENV_ACTIVATE="{venv_dir}/bin/activate"
 
@@ -950,6 +951,12 @@ log() {{ echo "$(date '+%Y-%m-%d %H:%M:%S') [music-workflow] $*"; }}
 log "Watcher started"
 log "Monitoring: $TAGGED_DIR"
 log "Debounce: ${{DEBOUNCE}}s"
+
+# Initial delay (e.g. wait for remote NFS mounts after boot)
+if [[ $STARTUP_DELAY -gt 0 ]]; then
+    log "Waiting ${{STARTUP_DELAY}}s for mounts to settle..."
+    sleep "$STARTUP_DELAY"
+fi
 
 # Wait for tagged directory to become available (e.g. remote mount)
 while [[ ! -d "$TAGGED_DIR" ]]; do
@@ -987,8 +994,6 @@ done
         "[Service]",
         "Type=simple",
     ]
-    if startup_delay > 0:
-        service_lines.append(f"ExecStartPre=/bin/sleep {startup_delay}")
     service_lines.extend([
         f"ExecStart={watcher_path}",
         "Restart=on-failure",

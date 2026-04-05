@@ -16,10 +16,14 @@ Config: ~/.config/music-workflow/
 
 from __future__ import annotations
 
+import argparse
+import fcntl
 import json
 import os
 import shutil
+import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -39,6 +43,7 @@ SETTINGS_FILE_NAME = "settings.json"
 DEFINITIONS_FILE_NAME = "artist_genres.json"
 VARIOUS_ARTISTS = "Various Artists"
 BANNER = "=" * 78
+LOCKFILE_NAME = ".workflow.lock"
 
 DEFAULT_SETTINGS: dict = {
     "tagged_dir": "",
@@ -111,6 +116,39 @@ def _deep_copy_defaults() -> dict:
 
 def save_settings(cfg_dir: Path, settings: dict) -> None:
     _write_json(cfg_dir / SETTINGS_FILE_NAME, settings)
+
+
+@contextmanager
+def workflow_lock(cfg_dir: Path, blocking: bool = True):
+    """Acquire an exclusive lock to prevent concurrent workflow runs.
+
+    Args:
+        cfg_dir: Config directory where the lock file lives.
+        blocking: If True, block until the lock is available.
+                  If False, raise RuntimeError immediately if locked.
+    """
+    lock_path = cfg_dir / LOCKFILE_NAME
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(lock_path, "w")
+    locked = False
+    try:
+        flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(lock_fd, flags)
+            locked = True
+        except OSError:
+            raise RuntimeError("Another workflow instance is already running.")
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+        yield
+    finally:
+        if locked:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def load_definitions(cfg_dir: Path) -> Dict[str, str]:
@@ -362,7 +400,7 @@ def _make_enforcer_cfg(settings: dict) -> enforcer.AppConfig:
 # Workflow execution
 # ---------------------------------------------------------------------------
 
-def run_workflow(settings: dict, definitions: Dict[str, str], cfg_dir: Path) -> None:
+def run_workflow(settings: dict, definitions: Dict[str, str], cfg_dir: Path, *, auto: bool = False) -> None:
     """Execute the full workflow pipeline."""
     tagged_dir = settings["tagged_dir"]
     clean_dir = settings["clean_library_dir"]
@@ -394,7 +432,7 @@ def run_workflow(settings: dict, definitions: Dict[str, str], cfg_dir: Path) -> 
     print("Step 1: Essentia Analysis")
     print(f"{'─' * 70}")
 
-    if prompt_yes_no("Run Essentia analysis on tagged files?", default=True):
+    if auto or prompt_yes_no("Run Essentia analysis on tagged files?", default=True):
         log_file = run_essentia(tagged_dir, settings)
         if log_file:
             print(f"\nEssentia log: {log_file}")
@@ -809,6 +847,265 @@ def edit_settings(cfg_dir: Path, settings: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Service setup
+# ---------------------------------------------------------------------------
+
+SERVICE_NAME = "music-workflow-watcher"
+
+
+def setup_service(cfg_dir: Path, settings: dict) -> None:
+    """Interactive setup for a systemd user service that watches the tagged directory."""
+    tagged_dir = settings.get("tagged_dir", "")
+    if not tagged_dir:
+        print("  Tagged directory not configured. Please configure settings first.")
+        pause()
+        return
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Detect virtual environment
+    venv_dir = os.environ.get("VIRTUAL_ENV", "")
+    if not venv_dir:
+        candidate = os.path.join(script_dir, "venv")
+        if os.path.isdir(candidate):
+            venv_dir = candidate
+
+    clear()
+    print(BANNER)
+    print(" Service Setup — Automatic File Watcher")
+    print(BANNER)
+    print()
+    print("  This creates a systemd user service that watches your tagged")
+    print("  directory and automatically runs the workflow when new files appear.")
+    print()
+    print("  How it works:")
+    print("    • Uses inotifywait (event-driven, near-zero CPU while idle)")
+    print("    • Detects new/moved files in the tagged directory")
+    print("    • Waits for file activity to settle (debounce)")
+    print("    • Runs 'workflow.py --auto' (Essentia → sort → enforce → move)")
+    print("    • Starts automatically on boot (with configurable delay)")
+    print()
+
+    # --- Check dependency ---
+    if shutil.which("inotifywait") is None:
+        print("  ⚠️  inotifywait not found!")
+        print("  Install with: sudo apt install inotify-tools")
+        print()
+        if prompt_yes_no("  Install inotify-tools now? (requires sudo)", default=True):
+            try:
+                subprocess.run(
+                    ["sudo", "apt", "install", "-y", "inotify-tools"], check=True
+                )
+                print()
+                print("  ✅ inotify-tools installed.")
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                print("  ❌ Installation failed. Please install manually.")
+                pause()
+                return
+        else:
+            print("  Cannot continue without inotify-tools.")
+            pause()
+            return
+    else:
+        print("  ✅ inotifywait found")
+
+    print()
+    print("  Configuration")
+    print("  " + "─" * 68)
+
+    startup_delay = prompt_int(
+        "  Startup delay in seconds (wait for remote mounts, 0=none)", 60, 0, 600
+    )
+    debounce = prompt_int(
+        "  Debounce interval in seconds (settle time after last file event)",
+        30, 5, 300,
+    )
+    venv_dir = prompt_path("  Python virtual environment directory", venv_dir)
+
+    if not os.path.isfile(os.path.join(venv_dir, "bin", "activate")):
+        print(f"  ⚠️  No activate script found at {venv_dir}/bin/activate")
+        if not prompt_yes_no("  Continue anyway?", default=False):
+            pause()
+            return
+
+    # --- Generate watcher script ---
+    watcher_path = os.path.join(script_dir, "watcher.sh")
+    watcher_content = f"""#!/usr/bin/env bash
+# Music Workflow — File Watcher
+# Auto-generated by workflow.py service setup
+#
+# Tagged directory : {tagged_dir}
+# Debounce         : {debounce}s
+
+TAGGED_DIR="{tagged_dir}"
+DEBOUNCE={debounce}
+SCRIPT_DIR="{script_dir}"
+VENV_ACTIVATE="{venv_dir}/bin/activate"
+
+cd "$SCRIPT_DIR" || exit 1
+source "$VENV_ACTIVATE" || exit 1
+
+log() {{ echo "$(date '+%Y-%m-%d %H:%M:%S') [music-workflow] $*"; }}
+
+log "Watcher started"
+log "Monitoring: $TAGGED_DIR"
+log "Debounce: ${{DEBOUNCE}}s"
+
+# Wait for tagged directory to become available (e.g. remote mount)
+while [[ ! -d "$TAGGED_DIR" ]]; do
+    log "Tagged directory not available yet, retrying in 30s..."
+    sleep 30
+done
+
+log "Tagged directory available, watching for changes..."
+
+while true; do
+    # Block until a file event occurs (zero CPU while waiting)
+    inotifywait -r -q -e close_write,moved_to "$TAGGED_DIR" > /dev/null 2>&1
+
+    log "File activity detected, debouncing for ${{DEBOUNCE}}s..."
+
+    # Debounce: keep waiting while new events arrive within the window.
+    # inotifywait -t returns exit code 2 on timeout (no new events) which
+    # is falsy, ending the loop. Exit code 0 (event detected) continues.
+    while inotifywait -r -q -t "$DEBOUNCE" -e close_write,moved_to "$TAGGED_DIR" > /dev/null 2>&1; do
+        log "More activity detected, resetting debounce timer..."
+    done
+
+    log "Activity settled, running workflow..."
+    python workflow.py --auto 2>&1
+    log "Workflow complete, resuming watch..."
+done
+"""
+
+    # --- Generate systemd unit file ---
+    service_lines = [
+        "[Unit]",
+        "Description=Music Workflow — File Watcher",
+        "After=remote-fs.target network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+    ]
+    if startup_delay > 0:
+        service_lines.append(f"ExecStartPre=/bin/sleep {startup_delay}")
+    service_lines.extend([
+        f"ExecStart={watcher_path}",
+        "Restart=on-failure",
+        "RestartSec=30",
+        "StandardOutput=journal",
+        "StandardError=journal",
+        "",
+        "[Install]",
+        "WantedBy=default.target",
+    ])
+    service_content = "\n".join(service_lines) + "\n"
+
+    systemd_user_dir = Path.home() / ".config" / "systemd" / "user"
+    service_path = systemd_user_dir / f"{SERVICE_NAME}.service"
+
+    # --- Summary ---
+    print()
+    print("  Summary")
+    print("  " + "─" * 68)
+    print(f"    Watcher script  : {watcher_path}")
+    print(f"    Service file    : {service_path}")
+    print(f"    Tagged dir      : {tagged_dir}")
+    print(f"    Startup delay   : {startup_delay}s")
+    print(f"    Debounce        : {debounce}s")
+    print(f"    Virtual env     : {venv_dir}")
+    print()
+
+    if not prompt_yes_no("  Proceed with installation?", default=True):
+        pause()
+        return
+
+    print()
+
+    # Stop existing service if already running
+    if service_path.exists():
+        print("  ℹ️  Existing service found — updating configuration.")
+        subprocess.run(
+            ["systemctl", "--user", "stop", f"{SERVICE_NAME}.service"],
+            capture_output=True, text=True,
+        )
+
+    # Write watcher script
+    with open(watcher_path, "w") as f:
+        f.write(watcher_content)
+    os.chmod(watcher_path, 0o755)
+    print(f"  ✅ Watcher script: {watcher_path}")
+
+    # Write service file
+    systemd_user_dir.mkdir(parents=True, exist_ok=True)
+    with open(service_path, "w") as f:
+        f.write(service_content)
+    print(f"  ✅ Service file: {service_path}")
+
+    # Reload systemd
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    print("  ✅ systemd daemon reloaded")
+
+    # Enable service
+    result = subprocess.run(
+        ["systemctl", "--user", "enable", f"{SERVICE_NAME}.service"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print("  ✅ Service enabled (will start on boot)")
+    else:
+        print(f"  ⚠️  Enable failed: {result.stderr.strip()}")
+
+    # Lingering — needed for user services to start at boot before login
+    print()
+    user = os.getenv("USER", "")
+    linger_check = subprocess.run(
+        ["loginctl", "show-user", user, "--property=Linger"],
+        capture_output=True, text=True,
+    )
+    linger_enabled = "Linger=yes" in linger_check.stdout
+
+    if linger_enabled:
+        print("  ✅ Lingering already enabled (service will start at boot)")
+    else:
+        print("  Lingering is required for the service to start at boot")
+        print("  (before you log in). This requires elevated privileges.")
+        print()
+        if prompt_yes_no("  Enable lingering now? (requires sudo)", default=True):
+            result = subprocess.run(
+                ["sudo", "loginctl", "enable-linger", user], check=False
+            )
+            if result.returncode == 0:
+                print("  ✅ Lingering enabled")
+            else:
+                print(f"  ⚠️  Failed. Run manually: sudo loginctl enable-linger {user}")
+
+    # Start service
+    print()
+    if prompt_yes_no("  Start the service now?", default=True):
+        result = subprocess.run(
+            ["systemctl", "--user", "start", f"{SERVICE_NAME}.service"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            print("  ✅ Service started!")
+        else:
+            print(f"  ⚠️  Start failed: {result.stderr.strip()}")
+
+    # Show helpful commands
+    print()
+    print("  " + "─" * 68)
+    print("  Useful commands:")
+    print(f"    Status  : systemctl --user status {SERVICE_NAME}")
+    print(f"    Logs    : journalctl --user -u {SERVICE_NAME} -f")
+    print(f"    Stop    : systemctl --user stop {SERVICE_NAME}")
+    print(f"    Restart : systemctl --user restart {SERVICE_NAME}")
+    print(f"    Disable : systemctl --user disable {SERVICE_NAME}")
+    print()
+    pause()
+
+
+# ---------------------------------------------------------------------------
 # Main menu
 # ---------------------------------------------------------------------------
 
@@ -864,6 +1161,7 @@ def main_menu(cfg_dir: Path) -> int:
         print("  3) Settings")
         print("  4) Edit artist definitions")
         print("  5) Toggle dry run")
+        print("  6) Setup service  (auto-run on new files)")
         print("  q) Quit")
         print()
 
@@ -873,7 +1171,11 @@ def main_menu(cfg_dir: Path) -> int:
             return 0
 
         if choice == "1":
-            run_workflow(settings, definitions, cfg_dir)
+            try:
+                with workflow_lock(cfg_dir, blocking=False):
+                    run_workflow(settings, definitions, cfg_dir)
+            except RuntimeError as e:
+                print(f"  {e}")
             pause()
 
         elif choice == "2":
@@ -892,6 +1194,9 @@ def main_menu(cfg_dir: Path) -> int:
             print(f"  Dry run is now: {'ON' if settings['dry_run'] else 'OFF'}")
             pause()
 
+        elif choice == "6":
+            setup_service(cfg_dir, settings)
+
         else:
             print("  Invalid choice.")
             pause()
@@ -902,7 +1207,30 @@ def main_menu(cfg_dir: Path) -> int:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Music Workflow — Essentia analysis, genre enforcement, library management"
+    )
+    parser.add_argument(
+        "--auto", action="store_true",
+        help="Run the full workflow non-interactively (for use with the file watcher service)",
+    )
+    args = parser.parse_args()
+
     cfg = config_dir()
+
+    if args.auto:
+        settings = load_settings(cfg)
+        if not settings.get("tagged_dir"):
+            print("Error: No settings configured. Run workflow.py interactively first.")
+            return 1
+        try:
+            with workflow_lock(cfg, blocking=False):
+                definitions = load_definitions(cfg)
+                run_workflow(settings, definitions, cfg, auto=True)
+        except RuntimeError as e:
+            print(f"Skipping: {e}")
+        return 0
+
     return main_menu(cfg)
 
 

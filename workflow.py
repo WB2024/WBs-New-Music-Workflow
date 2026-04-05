@@ -5,10 +5,11 @@ Music Workflow - Orchestrates the music tagging pipeline.
 Pipeline:
   1. New music → tagged in MusicBrainz Picard → saved to Tagged directory
   2. Run this script:
-     a. Essentia analyses and writes genre/mood tags to all files
-     b. Artist folders compared against Clean library
-     c. New artists moved to staging directory
-     d. Existing artists get genre enforcement, then moved to Clean library
+     a. rsgain applies ReplayGain 2.0 loudness tags to all files
+     b. Essentia analyses and writes genre/mood tags to all files
+     c. Artist folders compared against Clean library
+     d. New artists moved to staging directory
+     e. Existing artists get genre enforcement, then moved to Clean library
   3. Manage new artists: define genres, apply, move to library
 
 Config: ~/.config/music-workflow/
@@ -49,6 +50,11 @@ DEFAULT_SETTINGS: dict = {
     "tagged_dir": "",
     "clean_library_dir": "",
     "new_artist_dir": "",
+    "replaygain": {
+        "enabled": True,
+        "skip_existing": True,        # -S: skip files that already have ReplayGain tags
+        "multithreaded": True,        # -m MAX: use all CPU threads
+    },
     "essentia": {
         "enable_genres": True,
         "enable_moods": True,
@@ -100,17 +106,22 @@ def load_settings(cfg_dir: Path) -> dict:
     if not isinstance(raw, dict):
         return _deep_copy_defaults()
     merged = _deep_copy_defaults()
-    merged.update({k: v for k, v in raw.items() if k != "essentia"})
+    merged.update({k: v for k, v in raw.items() if k not in ("essentia", "replaygain")})
     if isinstance(raw.get("essentia"), dict):
         ess = dict(DEFAULT_SETTINGS["essentia"])
         ess.update(raw["essentia"])
         merged["essentia"] = ess
+    if isinstance(raw.get("replaygain"), dict):
+        rg = dict(DEFAULT_SETTINGS["replaygain"])
+        rg.update(raw["replaygain"])
+        merged["replaygain"] = rg
     return merged
 
 
 def _deep_copy_defaults() -> dict:
     d = dict(DEFAULT_SETTINGS)
     d["essentia"] = dict(DEFAULT_SETTINGS["essentia"])
+    d["replaygain"] = dict(DEFAULT_SETTINGS["replaygain"])
     return d
 
 
@@ -349,6 +360,54 @@ def cleanup_empty_dirs(root: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ReplayGain integration (requires rsgain to be installed)
+# ---------------------------------------------------------------------------
+
+def run_replaygain(tagged_dir: str, settings: dict) -> bool:
+    """Run rsgain on *tagged_dir* to apply ReplayGain 2.0 tags.
+
+    Returns True if rsgain ran successfully, False otherwise.
+    """
+    rg = settings.get("replaygain", {})
+    if not rg.get("enabled", True):
+        print("  ReplayGain is disabled in settings.")
+        return True
+
+    if settings.get("dry_run", False):
+        print("  [DRY RUN] Would run rsgain on:", tagged_dir)
+        return True
+
+    # Check for rsgain binary
+    if not shutil.which("rsgain"):
+        print("  ⚠️  rsgain is not installed or not in PATH.")
+        print("  Install it: https://github.com/complexlogic/rsgain")
+        print("  Skipping ReplayGain step.")
+        return False
+
+    cmd = ["rsgain", "easy"]
+
+    if rg.get("skip_existing", True):
+        cmd.append("-S")
+
+    if rg.get("multithreaded", True):
+        cmd.extend(["-m", "MAX"])
+
+    cmd.append(tagged_dir)
+
+    print(f"  Running: {' '.join(cmd)}")
+    print()
+
+    result = subprocess.run(cmd)
+
+    if result.returncode != 0:
+        print(f"\n  ⚠️  rsgain exited with code {result.returncode}")
+        return False
+
+    print()
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Essentia integration (lazy import to avoid requiring essentia at startup)
 # ---------------------------------------------------------------------------
 
@@ -427,9 +486,16 @@ def run_workflow(settings: dict, definitions: Dict[str, str], cfg_dir: Path, *, 
     total_files = sum(count_audio_files(p) for _, _, p in artists)
     print(f"Found {len(artists)} artist(s), ~{total_files} audio files\n")
 
-    # --- Step 1: Essentia analysis ---
+    # --- Step 1: ReplayGain ---
     print(f"{'─' * 70}")
-    print("Step 1: Essentia Analysis")
+    print("Step 1: ReplayGain")
+    print(f"{'─' * 70}")
+
+    run_replaygain(tagged_dir, settings)
+
+    # --- Step 2: Essentia analysis ---
+    print(f"{'─' * 70}")
+    print("Step 2: Essentia Analysis")
     print(f"{'─' * 70}")
 
     if auto or prompt_yes_no("Run Essentia analysis on tagged files?", default=True):
@@ -439,9 +505,9 @@ def run_workflow(settings: dict, definitions: Dict[str, str], cfg_dir: Path, *, 
     else:
         print("Skipping Essentia analysis.")
 
-    # --- Step 2: Sort artists into new vs existing ---
+    # --- Step 3: Sort artists into new vs existing ---
     print(f"\n{'─' * 70}")
-    print("Step 2: Sorting Artists")
+    print("Step 3: Sorting Artists")
     print(f"{'─' * 70}")
 
     # Re-scan (Essentia may have been skipped, but structure is unchanged)
@@ -472,7 +538,7 @@ def run_workflow(settings: dict, definitions: Dict[str, str], cfg_dir: Path, *, 
     # --- Step 4: Genre enforcement for existing artists ---
     if existing:
         print(f"\n{'─' * 70}")
-        print("Step 3: Genre Enforcement")
+        print("Step 4: Genre Enforcement")
         print(f"{'─' * 70}")
 
         enforcer_cfg = _make_enforcer_cfg(settings)
@@ -497,7 +563,7 @@ def run_workflow(settings: dict, definitions: Dict[str, str], cfg_dir: Path, *, 
     # --- Step 5: Move existing artists to clean library ---
     if existing:
         print(f"\n{'─' * 70}")
-        print("Step 4: Moving to Library")
+        print("Step 5: Moving to Library")
         print(f"{'─' * 70}")
 
         for rel_dir, name, path in existing:
@@ -748,29 +814,40 @@ def edit_settings(cfg_dir: Path, settings: dict) -> dict:
         print(" Settings")
         print(BANNER)
 
+        rg = settings.get("replaygain", {})
+
         print("\n  Directories:")
         print(f"    1) Tagged directory      : {settings.get('tagged_dir', '')}")
         print(f"    2) Clean library         : {settings.get('clean_library_dir', '')}")
         print(f"    3) New artist directory  : {settings.get('new_artist_dir', '')}")
 
+        rg_enabled = "Yes" if rg.get("enabled", True) else "No"
+        rg_skip = "Yes" if rg.get("skip_existing", True) else "No"
+        rg_mt = "Yes" if rg.get("multithreaded", True) else "No"
+        rg_installed = "installed" if shutil.which("rsgain") else "not found"
+        print(f"\n  ReplayGain ({rg_installed}):")
+        print(f"    4) Enabled               : {rg_enabled}")
+        print(f"    5) Skip existing tags    : {rg_skip}")
+        print(f"    6) Multithreaded         : {rg_mt}")
+
         print(f"\n  Essentia:")
-        print(f"    4) Analysis mode         : {mode_label}")
-        print(f"    5) Number of genres      : {ess.get('top_n_genres', 3)}")
-        print(f"    6) Genre threshold       : {ess.get('genre_threshold', 15)}%")
-        print(f"    7) Genre format          : {ess.get('genre_format', 'parent_child')}")
-        print(f"    8) Mood threshold        : {ess.get('mood_threshold', 0.5)}%")
+        print(f"    7) Analysis mode         : {mode_label}")
+        print(f"    8) Number of genres      : {ess.get('top_n_genres', 3)}")
+        print(f"    9) Genre threshold       : {ess.get('genre_threshold', 15)}%")
+        print(f"   10) Genre format          : {ess.get('genre_format', 'parent_child')}")
+        print(f"   11) Mood threshold        : {ess.get('mood_threshold', 0.5)}%")
         conf = "Yes" if ess.get("write_confidence_tags", True) else "No"
-        print(f"    9) Confidence tags       : {conf}")
+        print(f"   12) Confidence tags       : {conf}")
         ow = "Yes" if ess.get("overwrite_existing", False) else "No"
-        print(f"   10) Overwrite existing    : {ow}")
-        print(f"   11) Workers               : {workers_label}")
+        print(f"   13) Overwrite existing    : {ow}")
+        print(f"   14) Workers               : {workers_label}")
         dur = ess.get("max_audio_duration", 300)
-        print(f"   12) Max audio duration    : {dur}s")
-        print(f"   13) Model directory       : {ess.get('model_dir', '~/essentia_models')}")
+        print(f"   15) Max audio duration    : {dur}s")
+        print(f"   16) Model directory       : {ess.get('model_dir', '~/essentia_models')}")
 
         dr = "Yes" if settings.get("dry_run", False) else "No"
         print(f"\n  General:")
-        print(f"   14) Dry run               : {dr}")
+        print(f"   17) Dry run               : {dr}")
 
         print(f"\n    s) Save and go back")
         print(f"    b) Back (discard changes)")
@@ -800,46 +877,52 @@ def edit_settings(cfg_dir: Path, settings: dict) -> dict:
                 "  New artist directory", settings.get("new_artist_dir", "")
             )
         elif choice == "4":
+            rg["enabled"] = not rg.get("enabled", True)
+        elif choice == "5":
+            rg["skip_existing"] = not rg.get("skip_existing", True)
+        elif choice == "6":
+            rg["multithreaded"] = not rg.get("multithreaded", True)
+        elif choice == "7":
             print("    1 = Genres & Moods  |  2 = Genres only  |  3 = Moods only")
             m = prompt_int("    Mode", 1, 1, 3)
             ess["enable_genres"] = m in (1, 2)
             ess["enable_moods"] = m in (1, 3)
-        elif choice == "5":
+        elif choice == "8":
             ess["top_n_genres"] = prompt_int(
                 "  Genres per track (1-10)", ess.get("top_n_genres", 3), 1, 10
             )
-        elif choice == "6":
+        elif choice == "9":
             ess["genre_threshold"] = prompt_float(
                 "  Genre threshold %", ess.get("genre_threshold", 15), 1, 50
             )
-        elif choice == "7":
+        elif choice == "10":
             print("    1=parent_child  2=child_parent  3=child_only  4=raw")
             f = prompt_int("    Format", 1, 1, 4)
             fmt_map = {1: "parent_child", 2: "child_parent", 3: "child_only", 4: "raw"}
             ess["genre_format"] = fmt_map[f]
-        elif choice == "8":
+        elif choice == "11":
             ess["mood_threshold"] = prompt_float(
                 "  Mood threshold %", ess.get("mood_threshold", 0.5), 0.01, 20
             )
-        elif choice == "9":
+        elif choice == "12":
             ess["write_confidence_tags"] = not ess.get("write_confidence_tags", True)
-        elif choice == "10":
+        elif choice == "13":
             ess["overwrite_existing"] = not ess.get("overwrite_existing", False)
-        elif choice == "11":
+        elif choice == "14":
             cpu = os.cpu_count() or 2
             ess["workers"] = prompt_int(
                 f"  Workers (0=auto, 1-{cpu})", ess.get("workers", 0), 0, cpu
             )
-        elif choice == "12":
+        elif choice == "15":
             ess["max_audio_duration"] = prompt_int(
                 "  Max duration (seconds, 0=unlimited)",
                 ess.get("max_audio_duration", 300), 0, 3600,
             )
-        elif choice == "13":
+        elif choice == "16":
             ess["model_dir"] = prompt_path(
                 "  Model directory", ess.get("model_dir", "~/essentia_models")
             )
-        elif choice == "14":
+        elif choice == "17":
             settings["dry_run"] = not settings.get("dry_run", False)
         else:
             print("  Invalid option.")
@@ -1192,7 +1275,7 @@ def main_menu(cfg_dir: Path) -> int:
         print(f"  Definitions       : {def_count} artist(s) defined")
         print(BANNER)
         print()
-        print("  1) Run workflow  (Essentia → sort → enforce → move)")
+        print("  1) Run workflow  (ReplayGain → Essentia → sort → enforce → move)")
         print("  2) Manage new artists  (define genres + move to library)")
         print("  3) Settings")
         print("  4) Edit artist definitions")

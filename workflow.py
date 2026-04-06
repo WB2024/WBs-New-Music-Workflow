@@ -1378,15 +1378,18 @@ send_notification() {{
 
     log "Sending notification for $count new artist(s)"
 
-    # notify-send --action implies --wait: blocks until dismissed or clicked,
-    # then prints the chosen action name to stdout
+    # --urgency=critical keeps the notification visible until user interaction.
+    # --action implies --wait: blocks until dismissed or clicked,
+    # then prints the chosen action name to stdout.
     (
         local action
         action=$(notify-send \\
             --app-name="Music Workflow" \\
             --icon="folder-music" \\
+            --urgency=critical \\
             --action="open=Open Folder" \\
             --action="workflow=Run Workflow" \\
+            --action="dismiss=Dismiss" \\
             "New Artists to Define" \\
             "$body" 2>/dev/null)
 
